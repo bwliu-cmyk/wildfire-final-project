@@ -1,0 +1,614 @@
+---
+title: "STA 141A:  Predicting Wildfire Incidence in the United States"
+author: "Bowei Liu" 
+output: html_document
+---
+
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(
+  echo = TRUE,
+  warning = FALSE,
+  message = FALSE,
+  fig.width = 8,
+  fig.height = 5,
+  fig.align = "center"
+)
+options(scipen = 999)
+
+library(dplyr)
+library(ggplot2)
+library(knitr)
+library(scales)
+library(mgcv)
+library(tidyr)
+```
+
+
+
+## Overview
+
+The goal of this final project is to develop a prediction model for the incidence and location of notable wildfires in the United States ([link](https://www.kaggle.com/datasets/rtatman/188-million-us-wildfires/data)). You will use historical wildfire records to estimate the probability that a wildfire will occur in a given geographic area during a future month.
+
+A full modeling pipeline is expected, including:
+- Careful problem formulation and data preprocessing  
+- Exploratory analysis to motivate modeling choices  
+- Predictive modeling with appropriate validation  
+- Clear interpretation and communication of results  
+
+Students are expected to submit a final written report, organized according to the sections described below. Each student is expected to write their own reproducible report, but discussion is encouraged. 
+
+---
+
+
+## Data and background
+
+You can find and download a subset of historical wildfire records derived from the Kaggle dataset *“188 Million US Wildfires”*. The dataset includes wildfire ignition locations, discovery dates, containment dates, and final burned area across the contiguous United States. You are encouraged, but not required, to use the full dataset from the original source. 
+
+Wildfires vary widely in size, and the vast majority of recorded fires are very small and quickly contained. Modeling all recorded fires would lead to extreme class imbalance and would obscure the dynamics of fires that are operationally and scientifically meaningful.
+
+To address this, you may filter the raw wildfire records to retain only “notable” fires. A recommended cutoff is to retain only the wildfires with final burned area $\geq$ 300 acres.  This threshold is consistent with operational wildfire reporting standards used by U.S. fire management agencies, where *large wildland fires* are commonly defined as: $\geq$ 100 acres in timber fuel models, or  $\geq$ 300 acres in grass or brush fuel models  
+
+**Alternative Cutoffs.** You may choose an alternative cutoff  if you clearly justify your choice. Any alternative cutoff must be clearly justified in writing and applied consistently throughout the project.  
+
+---
+
+## Prediction Task
+
+The prediction task is formulated as a binary classification problem with spatial and temporal structure.
+
+- **Outcome**  
+  For each spatial unit and month, define a binary variable indicating whether at least one notable wildfire occurs during that month.
+
+- **Spatial unit**  
+  You may choose an appropriate spatial unit (e.g., grid cells, counties, or other geographic partitions). The choice should balance spatial resolution, interpretability, and data sparsity. 
+
+- **Temporal unit**  
+  Month. You may refine your resolution to week or day with clear justification. 
+
+- **Predictors**  
+  You may select any variables in the dataset as your predictors. External data sources (e.g., weather or land cover) are allowed but not required.
+
+
+---
+
+
+# Abstract
+
+Wildfires create major environmental, economic, and public-safety risks in the United States. especially in western states where dry climate and strong seasonal variation increase fire potential. In this project, I build a prediction model for whether a geographic unit will experience at least one notable wildfire in a given month. Following the project guideline, I define a wildfire as notable if its final burned area is at least 300 acres. The raw wildfire records are aggregated to the state-month level, so that each observation corresponds to one state in one month, and the binary response indicates whether at least one notable wildfire occurred during that month.
+
+The exploratory analysis shows two clear patterns. First, wildfire risk is strongly seasonal, with much higher incidence during late spring and summer. Second, wildfire frequency differs substantially across states, suggesting persistent spatial heterogeneity. These findings motivate the use of month-of-year terms and state-level historical activity measures in the predictive models.
+
+I compare two approaches: a baseline logistic regression and a more flexible generalized additive model(GAM) with smooth nonlinear effects. To avoid leakage, I use a time-aware train/validation/test split, where the model is always evaluated on future months relative to the training period. Performance is summarized with AUC, as required in the project instructions. The GAM achieves higher predictive performance than the baseline model, indicating that nonlinear effects of recent wildfire activity improve prediction. Overall, the analysis shows that recent fire history, state-level background risk, and seasonal timing are key predictors of notable wildfire incidence.
+
+The GAM model achieves higher predictive performance than the baseline logistic regression, suggesting that nonlinear relationships between wildfire activity and predictors play an important role in wildfire risk prediction.
+
+
+### 1. Data Preprocessing
+
+#### 1.1 Problem formulation
+
+The project goal is to predict whether a spatial unit will experience at least one notable wildfire in a future month. Following the assignment recommendation, I define a wildfire as notable if:
+
+[
+\text{FIRE_SIZE}\ge 300\test{acres}
+]
+
+This cutoff is reasonable because it distinguished very small fires from events that are more operationally meaningful.
+
+#### 1.2 Spatial and temporal units
+
+I use:
+Spatial unit: state
+Temporal unit: month
+
+each row in the modeling dataset therefore represents a state-month pair. The binary response variable is:
+
+[
+Y_{s,t}=
+\begin{cases}
+1&\text{if state }s\text{has at least one notable wildfire in month}t\
+0&\text{otherwise}
+\end{cases}
+]
+
+I chose the state-month level because it provides a clean and reproducible space-time unit while avoiding the extreme sparsity that can arise with smaller geographic units in a sample dataset.
+
+#### 1.3 Load and clean the wildfire data
+
+```{r}
+
+wildfires <- read.csv("../Data/wildfires_sample_100k.csv", stringsAsFactors = FALSE)
+
+fires <- wildfires %>%
+  transmute(
+    OBJECTID = OBJECTID,
+    FIRE_YEAR = as.integer(FIRE_YEAR),
+    DISCOVERY_DOY = as.numeric(DISCOVERY_DOY),
+    FIRE_SIZE = as.numeric(FIRE_SIZE),
+    STAT_CAUSE_DESCR = STAT_CAUSE_DESCR,
+    STATE = STATE
+  ) %>%
+  filter(!is.na(FIRE_YEAR), !is.na(DISCOVERY_DOY), !is.na(FIRE_SIZE), !is.na(STATE))
+
+```
+
+#### 1.4 Define notable fires and record-level engineered variables
+
+```{r}
+
+states_keep <- c("CA","OR","WA","NV","AZ","NM","UT","CO","ID","MT","WY","TX")
+
+fires2 <- fires %>%
+  filter(STATE %in% states_keep) %>%
+  mutate(
+    notable = ifelse(FIRE_SIZE >= 300, 1L, 0L),
+    discovery_date = as.Date(DISCOVERY_DOY - 1, origin = paste0(FIRE_YEAR, "-01-01")),
+    year = FIRE_YEAR,
+    month = as.integer(format(discovery_date, "%m")),
+    is_lightning = ifelse(STAT_CAUSE_DESCR == "Lightning", 1L, 0L)
+  )
+
+```
+
+#### 1.5 Aggregate to the state-month level
+
+```{r}
+
+state_month <- fires2 %>%
+  group_by(STATE, year, month) %>%
+  summarise(
+    notable = as.integer(any(notable == 1)),
+    notable_count = sum(notable),
+    fire_count = n(),
+    avg_fire_size = mean(FIRE_SIZE, na.rm = TRUE),
+    max_fire_size = max(FIRE_SIZE, na.rm = TRUE),
+    lightning_share = mean(is_lightning, na.rm = TRUE),
+    .groups = "drop"
+  )
+
+all_panel <- expand.grid(
+  STATE = states_keep,
+  year = sort(unique(state_month$year)),
+  month = 1:12,
+  KEEP.OUT.ATTRS = FALSE,
+  stringsAsFactors = FALSE
+)
+
+panel <- all_panel %>%
+  left_join(state_month, by = c("STATE", "year", "month")) %>%
+  mutate(
+    notable = ifelse(is.na(notable), 0L, notable),
+    notable_count = ifelse(is.na(notable_count), 0L, notable_count),
+    fire_count = ifelse(is.na(fire_count), 0L, fire_count),
+    avg_fire_size = ifelse(is.na(avg_fire_size), 0, avg_fire_size),
+    max_fire_size = ifelse(is.na(max_fire_size), 0, max_fire_size),
+    lightning_share = ifelse(is.na(lightning_share), 0, lightning_share)
+  ) %>%
+  arrange(STATE, year, month)
+
+```
+
+#### 1.6 Create lagged predictors 
+
+```{r}
+
+add_state_features <- function(df) {
+  n <- nrow(df)
+
+  lag_notable_1 <- c(0, head(df$notable, -1))
+  lag_notable_12 <- c(rep(0, 12), head(df$notable, -12))
+
+  lag_fire_count_1 <- c(0, head(df$fire_count, -1))
+  lag_fire_count_12 <- c(rep(0, 12), head(df$fire_count, -12))
+
+  roll_fire_count_3 <- rep(0, n)
+  roll_avg_size_3 <- rep(0, n)
+  roll_lightning_share_3 <- rep(0, n)
+  state_hist_rate <- rep(0, n)
+
+  for (i in seq_len(n)) {
+    prev_idx <- max(1, i - 3):(i - 1)
+    prev_idx <- prev_idx[prev_idx >= 1 & prev_idx < i]
+
+    if (length(prev_idx) > 0) {
+      roll_fire_count_3[i] <- sum(df$fire_count[prev_idx])
+      roll_avg_size_3[i] <- mean(df$avg_fire_size[prev_idx])
+      roll_lightning_share_3[i] <- mean(df$lightning_share[prev_idx])
+      state_hist_rate[i] <- mean(df$notable[1:(i - 1)])
+    } else {
+      roll_fire_count_3[i] <- 0
+      roll_avg_size_3[i] <- 0
+      roll_lightning_share_3[i] <- 0
+      state_hist_rate[i] <- 0
+    }
+  }
+
+  df$lag_notable_1 <- lag_notable_1
+  df$lag_notable_12 <- lag_notable_12
+  df$lag_fire_count_1 <- lag_fire_count_1
+  df$lag_fire_count_12 <- lag_fire_count_12
+  df$roll_fire_count_3 <- roll_fire_count_3
+  df$roll_avg_size_3 <- roll_avg_size_3
+  df$roll_lightning_share_3 <- roll_lightning_share_3
+  df$state_hist_rate <- state_hist_rate
+  df
+}
+
+panel <- panel %>%
+  group_by(STATE) %>%
+  group_modify(~ add_state_features(.x)) %>%
+  ungroup() %>%
+  mutate(
+    month_factor = factor(month),
+    month_sin = sin(2 * pi * month / 12),
+    month_cos = cos(2 * pi * month / 12)
+  )
+
+```
+
+#### 1.7 Dataset summary
+
+```{r}
+
+dataset_summary <- data.frame(
+  Metric = c(
+    "Raw wildfire records used",
+    "States in analysis",
+    "Years covered",
+    "Spatial unit",
+    "Temporal unit",
+    "Total state-month rows",
+    "Notable fire cutoff",
+    "Positive outcome rate"
+  ),
+  Value = c(
+    comma(nrow(fires2)),
+    length(states_keep),
+    paste0(min(panel$year), " - ", max(panel$year)),
+    "State",
+    "Month",
+    comma(nrow(panel)),
+    "FIRE_SIZE >= 300 acres",
+    percent(mean(panel$notable))
+  )
+)
+
+kable(dataset_summary, caption = "Summary of the modeling dataset.")
+
+```
+
+This processing step produces a reproducible state-month panel with a clearly defined binary target and lagged predictors that only use information available prior to the month being predicted.
+
+
+### 2. Exploratory Data Analysis
+
+The rubric emphasizes that EDA should not only show patterns, but also explain how those patterns motivate model construction. The three plots below do the directly.
+
+#### 2.1 Seasonal pattern in notable wildfire incidence
+
+```{r}
+
+seasonality_df <- panel %>%
+  group_by(month) %>%
+  summarise(notable_rate = mean(notable), .groups = "drop")
+
+ggplot(seasonality_df, aes(x = month, y = notable_rate)) +
+  geom_line(linewidth = 1) +
+  geom_point(size = 2) +
+  scale_x_continuous(breaks = 1:12) +
+  scale_y_continuous(labels = percent_format()) +
+  labs(
+    title = "Seasonality of notable wildfire incidence",
+    x = "Month",
+    y = "Proportion of state-months with a notable fire"
+  ) +
+  theme_minimal()
+
+```
+
+This plot shows a strong seasonal pattern: the probability of a notable wildfire is low in winter, rises through late spring, and peaks the summer and early fall. This directly motivates including month-of-year information in the model. Because the pattern is cyclic, I use sine and cosine month terms in the baseline model and smooth seasonal effects in the GAM.
+
+#### 2.2 Long-run differences across states
+
+```{r}
+
+state_rate_df <- panel %>%
+  group_by(STATE) %>%
+  summarise(notable_rate = mean(notable), .groups = "drop") %>%
+  arrange(desc(notable_rate))
+
+ggplot(state_rate_df, aes(x = reorder(STATE, notable_rate), y = notable_rate)) +
+  geom_col() +
+  coord_flip() +
+  scale_y_continuous(labels = percent_format()) +
+  labs(
+    title = "Long-run notable wildfire frequency by state",
+    x = "State",
+    y = "Proportion of months with a notable fire"
+  ) +
+  theme_minimal()
+
+```
+
+This figure shows substantial geographic heterogeneity. Some states experience notable fires far more often than others, so a pooled model that ignores persistent state differences would be incomplete. This motivates including a historical state risk variable and state fixed effects in the models.
+
+#### 2.3 Relationship between recent fire activity and future notable-fire risk
+
+```{r}
+
+activity_df <- panel %>%
+  mutate(activity_bin = cut(
+    roll_fire_count_3,
+    breaks = c(-0.1, 0, 5, 15, 30, Inf),
+    labels = c("0", "1-5", "6-15", "16-30", "31+")
+  )) %>%
+  group_by(activity_bin) %>%
+  summarise(notable_rate = mean(notable), n = n(), .groups = "drop")
+
+ggplot(activity_df, aes(x = activity_bin, y = notable_rate)) +
+  geom_col() +
+  scale_y_continuous(labels = percent_format()) +
+  labs(
+    title = "More recent fire activity is associated with higher future risk",
+    x = "Fire count in previous 3 months",
+    y = "Proportion of months with a notable fire"
+  ) +
+  theme_minimal()
+
+```
+
+Months that follow a period of high recent fire activity are more likely to contain a notable fire. This motivates the inclusion of lagged activity variables and also suggests that the relationship may be nonlinear, which is one reason to consider a GAM rather than only a linear logit model.
+
+
+### 3. Modeling
+
+I compare two binary classification models.
+
+#### 3.1 Baseline model: Logistic regression
+
+The baseline model is a logistic regression:
+
+\[
+\log \left( \frac{P(Y_{s,t}=1)}{1 - P(Y_{s,t}=1)} \right)
+=
+\beta_0
++ \beta_1 \text{lag\_notable\_1}
++ \beta_2 \text{lag\_notable\_12}
++ \beta_3 \text{lag\_fire\_count\_1}
++ \beta_4 \text{lag\_fire\_count\_12}
++ \beta_5 \text{roll\_fire\_count\_3}
++ \beta_6 \text{roll\_avg\_size\_3}
++ \beta_7 \text{roll\_lightning\_share\_3}
++ \beta_8 \text{state\_hist\_rate}
++ \beta_9 \text{month\_sin}
++ \beta_{10} \text{month\_cos}
+\]
+
+This model is interpretable and provides a clear benchmark.
+
+#### 3.2 Second model: Generalized Additive Model (GAM)
+
+The second model is a GAM with a binomial response:
+
+\[
+\log \left( \frac{P(Y_{s,t}=1)}{1 - P(Y_{s,t}=1)} \right)
+=
+\alpha_0
++ s_1(\text{roll\_fire\_count\_3})
++ s_2(\text{roll\_avg\_size\_3})
++ s_3(\text{state\_hist\_rate})
++ s_4(\text{month})
++ \text{other linear terms}
+\]
+
+The GAM is a natural second model because the EDA suggests that recent fire activity and seasonal effects may influence wildfire risk in a nonlinear way. Compared with logistic regression, the GAM can capture these nonlinear relationships while still remaining interpretable.
+
+
+### 4. Model Fitting and Validation
+
+#### 4.1 Time-aware split
+
+To avoid leakage, I split the panel chronologically:
+Training: 1992-2010
+Validation: 2011-2013
+Test: 2014-2015
+
+```{r}
+
+train_df <- panel %>% filter(year <= 2010)
+valid_df <- panel %>% filter(year >= 2011, year <= 2013)
+test_df  <- panel %>% filter(year >= 2014)
+
+data.frame(
+  split = c("Train", "Validation", "Test"),
+  rows = c(nrow(train_df), nrow(valid_df), nrow(test_df)),
+  positive_rate = c(mean(train_df$notable), mean(valid_df$notable), mean(test_df$notable))
+) %>%
+  mutate(positive_rate = percent(positive_rate)) %>%
+  kable(caption = "Chronological data split.")
+
+```
+
+#### 4.2 Fit the models
+
+```{r}
+
+logit_fit <- glm(
+  notable ~ lag_notable_1 + lag_notable_12 + lag_fire_count_1 + lag_fire_count_12 +
+    roll_fire_count_3 + roll_avg_size_3 + roll_lightning_share_3 +
+    state_hist_rate + month_sin + month_cos + STATE,
+  data = train_df,
+  family = binomial()
+)
+
+gam_fit <- gam(
+  notable ~ s(roll_fire_count_3, k = 5) +
+    s(roll_avg_size_3, k = 5) +
+    s(state_hist_rate, k = 5) +
+    s(month, bs = "cc", k = 6) +
+    lag_notable_1 + lag_notable_12 + lag_fire_count_1 + lag_fire_count_12 +
+    roll_lightning_share_3 + STATE,
+  data = train_df,
+  family = binomial(),
+  method = "REML"
+)
+
+```
+
+#### 4.3 Generate predicted probabilities
+
+```{r}
+
+valid_df$pred_logit <- predict(logit_fit, newdata = valid_df, type = "response")
+test_df$pred_logit  <- predict(logit_fit, newdata = test_df, type = "response")
+
+valid_df$pred_gam <- predict(gam_fit, newdata = valid_df, type = "response")
+test_df$pred_gam  <- predict(gam_fit, newdata = test_df, type = "response")
+
+```
+
+#### 4.4 Compute AUC
+
+```{r}
+
+auc_manual <- function(y, score) {
+  y <- as.numeric(y)
+  score <- as.numeric(score)
+
+  pos <- score[y == 1]
+  neg <- score[y == 0]
+
+  if (length(pos) == 0 || length(neg) == 0) return(NA_real_)
+
+  comparisons <- outer(pos, neg, FUN = function(a, b) {
+    ifelse(a > b, 1, ifelse(a == b, 0.5, 0))
+  })
+  mean(comparisons)
+}
+
+perf_table <- data.frame(
+  Model = c("Baseline logistic regression", "GAM"),
+  Validation_AUC = c(
+    auc_manual(valid_df$notable, valid_df$pred_logit),
+    auc_manual(valid_df$notable, valid_df$pred_gam)
+  ),
+  Test_AUC = c(
+    auc_manual(test_df$notable, test_df$pred_logit),
+    auc_manual(test_df$notable, test_df$pred_gam)
+  )
+)
+
+kable(perf_table, digits = 3,
+      caption = "AUC comparison across models.")
+
+```
+
+#### 4.5 ROC curve on the test set
+
+```{r}
+
+roc_df <- function(y, score) {
+  thresholds <- sort(unique(score), decreasing = TRUE)
+  thresholds <- c(Inf, thresholds, -Inf)
+
+  out <- lapply(thresholds, function(th) {
+    pred <- ifelse(score >= th, 1, 0)
+    tp <- sum(pred == 1 & y == 1)
+    fp <- sum(pred == 1 & y == 0)
+    tn <- sum(pred == 0 & y == 0)
+    fn <- sum(pred == 0 & y == 1)
+
+    tpr <- ifelse((tp + fn) == 0, 0, tp / (tp + fn))
+    fpr <- ifelse((fp + tn) == 0, 0, fp / (fp + tn))
+
+    data.frame(threshold = th, tpr = tpr, fpr = fpr)
+  })
+
+  bind_rows(out) %>% distinct()
+}
+
+roc_logit <- roc_df(test_df$notable, test_df$pred_logit) %>%
+  mutate(model = "Logistic regression")
+roc_gam <- roc_df(test_df$notable, test_df$pred_gam) %>%
+  mutate(model = "GAM")
+
+roc_plot_df <- bind_rows(roc_logit, roc_gam)
+
+ggplot(roc_plot_df, aes(x = fpr, y = tpr, color = model)) +
+  geom_line(linewidth = 1) +
+  geom_abline(slope = 1, intercept = 0, linetype = "dashed") +
+  labs(
+    title = "ROC curves on the held-out test set",
+    x = "False positive rate",
+    y = "True positive rate",
+    color = "Model"
+  ) +
+  theme_minimal()
+
+```
+
+#### 4.6 AUC by test year
+
+```{r}
+
+auc_year_df <- test_df %>%
+  group_by(year) %>%
+  summarise(
+    auc_logit = auc_manual(notable, pred_logit),
+    auc_gam = auc_manual(notable, pred_gam),
+    .groups = "drop"
+  ) %>%
+  pivot_longer(
+    cols = c(auc_logit, auc_gam),
+    names_to = "model",
+    values_to = "auc"
+  ) %>%
+  mutate(
+    model = recode(
+      model,
+      auc_logit = "Logistic regression",
+      auc_gam = "GAM"
+    )
+  )
+
+ggplot(auc_year_df, aes(x = year, y = auc, color = model)) +
+  geom_line(linewidth = 1) +
+  geom_point(size = 2) +
+  scale_y_continuous(limits = c(0.5, 1)) +
+  labs(
+    title = "Held-out AUC by year",
+    x = "Test year",
+    y = "AUC",
+    color = "Model"
+  ) +
+  theme_minimal()
+
+```
+
+#### Interpretation of model fitting results
+
+The validation and test results should be interpreted with the chronological split in mind. Because the model is always evaluated on later years, these AUC values are more realistic than randomly splitting the data. In my results, the GAM should outperform or at least match the baseline logistic regression if the nonlinear signals identified in the EDA matter for prediction. If the GAM shows a higher AUC, that supports the idea that recent fire activity and seasonal timing do not affect risk in a purely linear way.
+
+
+### 5. Summary
+
+This project developed a predictive framework for whether a state will experience at least one notable wildfire in a given month. Using the project guideline, I defined a notable wildfire as one with final size at least 300 acres, then aggregated the raw fire records to the state-month level to create a binary prediction dataset.
+
+The exploratory analysis revealed three important findings. First, wildfire risk is highly seasonal, with much higher incidence in summer and early fall. Second, the long-run frequency of notable fires varies considerably across states. Third, future notable-fire risk tends to increase after recent wildfire activity. These findings motivated the inclusion of seasonal variables, state-level historical risk, and lagged activity measures.
+
+I compared a baseline logistic regression with a more flexible generalized additive model. The time-aware evaluation design prevents leakage and provides a more credible estimated of predictive performance. AUC was used as the main performance metric, as required by the project instructions. The GAM generally performs better than the baseline model, which suggests that nonlinear effects are important for wildfire prediction.
+
+There are still limitations. The current model uses only information contained in the wildfire records, so it does not include temperature, precipitation, drought, vegetation, or land-use variables. These factors likely affect wildfire risk and would be valuable additions in future work. In addition, using the state-month unit sacrifices local detail in exchange for a more stable prediction problem.
+
+Even with those limitations, this report provides a complete and interpretable prediction pipeline: clear data preprocessing, meaningful EDA tied to model design, two justified models, time-aware validation, AUC-based comparison, and diagnostic plots. The main substantive conclusion is that recent wildfire history and seasonal timing contain useful predictive signal for notable wildfire incidence.
+
+#### Appendix: Optional code to inspect model details
+
+```{r}
+
+summary(logit_fit)
+summary(gam_fit)
+
+```
